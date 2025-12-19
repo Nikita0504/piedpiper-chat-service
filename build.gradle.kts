@@ -51,3 +51,26 @@ val compileKotlin: KotlinCompile by tasks
 compileKotlin.compilerOptions {
     freeCompilerArgs.set(listOf("-Xannotation-default-target=param-property"))
 }
+
+ktor {
+    docker {
+        jreVersion.set(JavaVersion.VERSION_21)
+        localImageName.set("piedpiper-chat-container")
+        imageTag.set("1.0")
+        portMappings.set(listOf(
+            io.ktor.plugin.features.DockerPortMapping(
+                80,
+                8083,
+                io.ktor.plugin.features.DockerPortMappingProtocol.TCP
+            )
+        ))
+
+        externalRegistry.set(
+            io.ktor.plugin.features.DockerImageRegistry.dockerHub(
+                appName = provider { "piedpiper-chat-container" },
+                username = providers.environmentVariable("DOCKER_HUB_USERNAME"),
+                password = providers.environmentVariable("DOCKER_HUB_PASSWORD")
+            )
+        )
+    }
+}

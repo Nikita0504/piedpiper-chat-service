@@ -1,5 +1,6 @@
 package com.piedpiper.features.user.di
 
+import com.piedpiper.common.Parameters
 import com.piedpiper.features.user.data.repository.UserDataRepository
 import com.piedpiper.features.user.data.services.UserService
 import io.ktor.client.*
@@ -18,6 +19,6 @@ val userModule = module {
     }
 
     single<UserDataRepository> {
-        UserService(get(), "http://0.0.0.0:8081/PiedPiper/api/v1")
+        UserService(get(), Parameters().USER_SERVICE)
     }
 }
