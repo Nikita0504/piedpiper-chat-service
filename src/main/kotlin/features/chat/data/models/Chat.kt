@@ -1,8 +1,7 @@
 package com.piedpiper.features.chat.data.models
 
 import kotlinx.serialization.Serializable
-import org.bson.codecs.pojo.annotations.BsonId
-import org.bson.types.ObjectId
+import java.util.UUID
 
 @Serializable
 data class UserMetadata(
@@ -12,8 +11,7 @@ data class UserMetadata(
 
 @Serializable
 data class Chat(
-    @BsonId
-    var id: String = ObjectId().toString(),
+    var id: String = UUID.randomUUID().toString(),
     val users: List<UserMetadata>,
     val chatName: String? = null,
     val description: String? = null,

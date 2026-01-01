@@ -1,13 +1,11 @@
 package com.piedpiper.features.chat.data.models
 
 import kotlinx.serialization.Serializable
-import org.bson.codecs.pojo.annotations.BsonId
-import org.bson.types.ObjectId
+import java.util.UUID
 
 @Serializable
 data class UserInChat(
-    @BsonId
-    val id: String = ObjectId().toString(),
+    val id: String = UUID.randomUUID().toString(),
     val chatId: String,
     val joinedAt: Long = System.currentTimeMillis()
 )

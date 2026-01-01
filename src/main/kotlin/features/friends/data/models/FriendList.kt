@@ -2,11 +2,9 @@ package com.piedpiper.features.friends.data.models
 
 import com.piedpiper.features.chat.data.models.UserMetadata
 import kotlinx.serialization.Serializable
-import org.bson.codecs.pojo.annotations.BsonId
 
 @Serializable
 data class FriendList(
-    @BsonId
     val userId: String,
     val friends: List<UserMetadata> = listOf(),
     val friendRequests: List<UserMetadata> = listOf()

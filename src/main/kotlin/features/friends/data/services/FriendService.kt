@@ -7,20 +7,25 @@ import com.piedpiper.features.friends.data.models.FriendList
 import com.piedpiper.features.friends.data.repository.FriendRepository
 import com.piedpiper.features.user.data.models.User
 import com.piedpiper.features.user.data.repository.UserDataRepository
+import com.piedpiper.features.database.FriendLists
 import io.ktor.http.HttpStatusCode
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
-import org.litote.kmongo.coroutine.CoroutineDatabase
-import org.litote.kmongo.eq
+import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import org.jetbrains.exposed.sql.update
 
 class FriendService(
-    dataBase: CoroutineDatabase,
+    private val database: Database,
     val userRepository: UserDataRepository
 ) : FriendRepository {
-
-    private val friendListCollection = dataBase.getCollection<FriendList>()
 
     private suspend fun getUserMetadata(userId: String): UserMetadata? {
         val userResponse = userRepository.getUserById(userId)
@@ -40,24 +45,37 @@ class FriendService(
         return null
     }
 
-    private suspend fun getOrCreateFriendList(userId: String): FriendList {
-        val existing = friendListCollection.findOne(FriendList::userId eq userId)
-        if (existing != null) {
-            return existing
+    private suspend fun getFriendList(userId: String): FriendList {
+        return newSuspendedTransaction(db = database) {
+            val friends = FriendLists.select {
+                FriendLists.userId eq userId and (FriendLists.isRequest eq false)
+            }.map { row ->
+                UserMetadata(
+                    userId = row[FriendLists.friendUserId],
+                    avatarUrl = row[FriendLists.friendAvatarUrl]
+                )
+            }
+            
+            val friendRequests = FriendLists.select {
+                FriendLists.userId eq userId and (FriendLists.isRequest eq true)
+            }.map { row ->
+                UserMetadata(
+                    userId = row[FriendLists.friendUserId],
+                    avatarUrl = row[FriendLists.friendAvatarUrl]
+                )
+            }
+            
+            FriendList(
+                userId = userId,
+                friends = friends,
+                friendRequests = friendRequests
+            )
         }
-        val newList = FriendList(userId = userId)
-        friendListCollection.insertOne(newList)
-        return newList
     }
 
     override suspend fun getFriends(requesterUserId: String): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while getting friends: ") {
-            val friendList = friendListCollection.findOne(FriendList::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.OK.value,
-                    message = "Friends list is empty",
-                    data = Json.encodeToJsonElement(emptyList<UserMetadata>())
-                )
+            val friendList = getFriendList(requesterUserId)
 
             SimpleResponse(
                 status = HttpStatusCode.OK.value,
@@ -69,12 +87,7 @@ class FriendService(
 
     override suspend fun getFriendRequests(requesterUserId: String): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while getting friend requests: ") {
-            val friendList = friendListCollection.findOne(FriendList::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.OK.value,
-                    message = "No friend requests",
-                    data = Json.encodeToJsonElement(emptyList<UserMetadata>())
-                )
+            val friendList = getFriendList(requesterUserId)
 
             SimpleResponse(
                 status = HttpStatusCode.OK.value,
@@ -99,7 +112,7 @@ class FriendService(
                     message = "Target user not found"
                 )
 
-            val requesterFriendList = getOrCreateFriendList(requesterUserId)
+            val requesterFriendList = getFriendList(requesterUserId)
             
             if (requesterFriendList.friends.any { it.userId == targetUserId }) {
                 return@runWithDefaultOnException SimpleResponse(
@@ -115,21 +128,22 @@ class FriendService(
                 )
             }
 
-            val targetFriendList = getOrCreateFriendList(targetUserId)
-            val updatedTargetFriendList = targetFriendList.addFriendRequest(
-                UserMetadata(
-                    userId = requesterUserId,
-                    avatarUrl = getUserMetadata(requesterUserId)?.avatarUrl
-                )
-            )
-
-            val isTargetUpdateSuccess = if (targetFriendList.userId == targetUserId && targetFriendList.friends.isEmpty() && targetFriendList.friendRequests.isEmpty()) {
-                friendListCollection.insertOne(updatedTargetFriendList).wasAcknowledged()
-            } else {
-                friendListCollection.updateOne(FriendList::userId eq targetUserId, updatedTargetFriendList).wasAcknowledged()
+            val requesterMetadata = getUserMetadata(requesterUserId)
+            val success = newSuspendedTransaction(db = database) {
+                try {
+                    FriendLists.insert {
+                        it[FriendLists.userId] = targetUserId
+                        it[FriendLists.friendUserId] = requesterUserId
+                        it[FriendLists.friendAvatarUrl] = requesterMetadata?.avatarUrl
+                        it[FriendLists.isRequest] = true
+                    }
+                    true
+                } catch (e: Exception) {
+                    false
+                }
             }
 
-            if (!isTargetUpdateSuccess) {
+            if (!success) {
                 return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.InternalServerError.value,
                     message = "Failed to send friend request"
@@ -145,12 +159,8 @@ class FriendService(
 
     override suspend fun acceptFriendRequest(requesterUserId: String, targetUserId: String): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while accepting friend request: ") {
-            val requesterFriendList = friendListCollection.findOne(FriendList::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.NotFound.value,
-                    message = "Friend list not found"
-                )
-
+            val requesterFriendList = getFriendList(requesterUserId)
+            
             if (!requesterFriendList.friendRequests.any { it.userId == targetUserId }) {
                 return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.NotFound.value,
@@ -170,29 +180,33 @@ class FriendService(
                     message = "Requester user not found"
                 )
 
-            val updatedRequesterFriendList = requesterFriendList.acceptFriendRequest(targetUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.InternalServerError.value,
-                    message = "Failed to accept friend request"
-                )
-
-            val isRequesterUpdateSuccess = friendListCollection.updateOne(
-                FriendList::userId eq requesterUserId,
-                updatedRequesterFriendList
-            ).wasAcknowledged()
-
-            val targetFriendList = getOrCreateFriendList(targetUserId)
-            val updatedTargetFriendList = targetFriendList
-                .addFriend(requesterMetadata)
-                .removeFriendRequest(requesterUserId)
-
-            val isTargetUpdateSuccess = if (targetFriendList.userId == targetUserId && targetFriendList.friends.isEmpty() && targetFriendList.friendRequests.isEmpty()) {
-                friendListCollection.insertOne(updatedTargetFriendList).wasAcknowledged()
-            } else {
-                friendListCollection.updateOne(FriendList::userId eq targetUserId, updatedTargetFriendList).wasAcknowledged()
+            val success = newSuspendedTransaction(db = database) {
+                try {
+                    FriendLists.deleteWhere {
+                        FriendLists.userId eq requesterUserId and (FriendLists.friendUserId eq targetUserId) and (FriendLists.isRequest eq true)
+                    }
+                    
+                    FriendLists.insert {
+                        it[FriendLists.userId] = requesterUserId
+                        it[FriendLists.friendUserId] = targetUserId
+                        it[FriendLists.friendAvatarUrl] = targetMetadata.avatarUrl
+                        it[FriendLists.isRequest] = false
+                    }
+                    
+                    FriendLists.insert {
+                        it[FriendLists.userId] = targetUserId
+                        it[FriendLists.friendUserId] = requesterUserId
+                        it[FriendLists.friendAvatarUrl] = requesterMetadata.avatarUrl
+                        it[FriendLists.isRequest] = false
+                    }
+                    
+                    true
+                } catch (e: Exception) {
+                    false
+                }
             }
 
-            if (isRequesterUpdateSuccess && isTargetUpdateSuccess) {
+            if (success) {
                 SimpleResponse(
                     status = HttpStatusCode.OK.value,
                     message = "Friend request accepted successfully",
@@ -209,12 +223,8 @@ class FriendService(
 
     override suspend fun declineFriendRequest(requesterUserId: String, targetUserId: String): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while declining friend request: ") {
-            val requesterFriendList = friendListCollection.findOne(FriendList::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.NotFound.value,
-                    message = "Friend list not found"
-                )
-
+            val requesterFriendList = getFriendList(requesterUserId)
+            
             if (!requesterFriendList.friendRequests.any { it.userId == targetUserId }) {
                 return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.NotFound.value,
@@ -222,13 +232,18 @@ class FriendService(
                 )
             }
 
-            val updatedFriendList = requesterFriendList.removeFriendRequest(targetUserId)
-            val isSuccess = friendListCollection.updateOne(
-                FriendList::userId eq requesterUserId,
-                updatedFriendList
-            ).wasAcknowledged()
+            val success = newSuspendedTransaction(db = database) {
+                try {
+                    FriendLists.deleteWhere {
+                        FriendLists.userId eq requesterUserId and (FriendLists.friendUserId eq targetUserId) and (FriendLists.isRequest eq true)
+                    }
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
 
-            if (isSuccess) {
+            if (success) {
                 SimpleResponse(
                     status = HttpStatusCode.OK.value,
                     message = "Friend request declined successfully"
@@ -244,12 +259,8 @@ class FriendService(
 
     override suspend fun removeFriend(requesterUserId: String, targetUserId: String): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while removing friend: ") {
-            val requesterFriendList = friendListCollection.findOne(FriendList::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.NotFound.value,
-                    message = "Friend list not found"
-                )
-
+            val requesterFriendList = getFriendList(requesterUserId)
+            
             if (!requesterFriendList.friends.any { it.userId == targetUserId }) {
                 return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.NotFound.value,
@@ -257,24 +268,23 @@ class FriendService(
                 )
             }
 
-            val updatedRequesterFriendList = requesterFriendList.removeFriend(targetUserId)
-            val isRequesterUpdateSuccess = friendListCollection.updateOne(
-                FriendList::userId eq requesterUserId,
-                updatedRequesterFriendList
-            ).wasAcknowledged()
-
-            val targetFriendList = friendListCollection.findOne(FriendList::userId eq targetUserId)
-            val isTargetUpdateSuccess = if (targetFriendList != null) {
-                val updatedTargetFriendList = targetFriendList.removeFriend(requesterUserId)
-                friendListCollection.updateOne(
-                    FriendList::userId eq targetUserId,
-                    updatedTargetFriendList
-                ).wasAcknowledged()
-            } else {
-                true
+            val success = newSuspendedTransaction(db = database) {
+                try {
+                    FriendLists.deleteWhere {
+                        FriendLists.userId eq requesterUserId and (FriendLists.friendUserId eq targetUserId) and (FriendLists.isRequest eq false)
+                    }
+                    
+                    FriendLists.deleteWhere {
+                        FriendLists.userId eq targetUserId and (FriendLists.friendUserId eq requesterUserId) and (FriendLists.isRequest eq false)
+                    }
+                    
+                    true
+                } catch (e: Exception) {
+                    false
+                }
             }
 
-            if (isRequesterUpdateSuccess && isTargetUpdateSuccess) {
+            if (success) {
                 SimpleResponse(
                     status = HttpStatusCode.OK.value,
                     message = "Friend removed successfully"
@@ -288,4 +298,3 @@ class FriendService(
         }
     }
 }
-

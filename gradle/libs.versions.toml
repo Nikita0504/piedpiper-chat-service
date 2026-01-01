@@ -3,7 +3,9 @@ kotlin = "2.2.20"
 ktor = "3.3.1"
 logback = "1.4.14"
 
-kmongo = "5.2.0"
+exposed = "0.49.0"
+postgresql = "42.7.3"
+hikaricp = "5.1.0"
 koin-version = "4.1.0-Beta1"
 
 
@@ -26,9 +28,12 @@ koin-test-junit5 = { module = "io.insert-koin:koin-test-junit5", version.ref = "
 ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-client-apache = { module = "io.ktor:ktor-client-apache", version.ref = "ktor" }
 ktor-client-content-negotiation = {module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor"}
-kmongo-core = { module = "org.litote.kmongo:kmongo-coroutine-core", version.ref = "kmongo"}
-kmongo-async = { module = "org.litote.kmongo:kmongo-async", version .ref= "kmongo" }
-kmongo-coroutine = {module = "org.litote.kmongo:kmongo-coroutine", version.ref = "kmongo"}
+exposed-core = { module = "org.jetbrains.exposed:exposed-core", version.ref = "exposed" }
+exposed-dao = { module = "org.jetbrains.exposed:exposed-dao", version.ref = "exposed" }
+exposed-jdbc = { module = "org.jetbrains.exposed:exposed-jdbc", version.ref = "exposed" }
+exposed-kotlin-datetime = { module = "org.jetbrains.exposed:exposed-kotlin-datetime", version.ref = "exposed" }
+postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
+hikaricp = { module = "com.zaxxer:HikariCP", version.ref = "hikaricp" }
 
 
 [plugins]

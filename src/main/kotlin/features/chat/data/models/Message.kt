@@ -1,8 +1,7 @@
 package com.piedpiper.features.chat.data.models
 
 import kotlinx.serialization.Serializable
-import org.bson.codecs.pojo.annotations.BsonId
-import org.bson.types.ObjectId
+import java.util.UUID
 
 @Serializable
 enum class MessageType {
@@ -26,8 +25,7 @@ data class MessagesResponse(
 
 @Serializable
 data class Message(
-    @BsonId
-    val id: String = ObjectId().toString(),
+    val id: String = UUID.randomUUID().toString(),
     val sender: String,
     val payload: String,
     val timestamp: Long,

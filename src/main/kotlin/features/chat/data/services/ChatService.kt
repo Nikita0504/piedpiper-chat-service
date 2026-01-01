@@ -3,11 +3,11 @@ package com.piedpiper.features.chat.data.services
 import com.piedpiper.common.SimpleResponse
 import com.piedpiper.common.runWithDefaultOnException
 import com.piedpiper.features.chat.data.models.Chat
-import com.piedpiper.features.chat.data.models.ChatMessages
-import com.piedpiper.features.chat.data.models.UserInChat
-import com.piedpiper.features.chat.data.models.UserInChats
 import com.piedpiper.features.chat.data.models.UserMetadata
 import com.piedpiper.features.chat.data.repository.ChatRepository
+import com.piedpiper.features.database.Chats
+import com.piedpiper.features.database.ChatUsers
+import com.piedpiper.features.database.UserInChats
 import com.piedpiper.features.user.data.models.User
 import com.piedpiper.features.user.data.repository.UserDataRepository
 import io.ktor.http.HttpStatusCode
@@ -15,41 +15,45 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
-import org.bson.types.ObjectId
-import org.litote.kmongo.coroutine.CoroutineDatabase
-import org.litote.kmongo.eq
-import org.litote.kmongo.setValue
-import org.litote.kmongo.`in`
+import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import org.jetbrains.exposed.sql.update
+import java.util.UUID
 
 class ChatService(
-    dataBase: CoroutineDatabase,
+    private val database: Database,
     val userRepository: UserDataRepository
 ): ChatRepository {
 
-    private val chatCollection = dataBase.getCollection<Chat>()
-    private val userInChatsCollection = dataBase.getCollection<UserInChats>()
-    private val chatMessagesCollection = dataBase.getCollection<ChatMessages>()
-
     private suspend fun addUsersToChat(
-        chatId: String,
+        chatId: UUID,
         participantUserIds: List<String>
     ): Boolean {
-        for (participantUserId in participantUserIds) {
-            val userChats = userInChatsCollection.findOne(UserInChats::userId eq participantUserId)
-            val userInChat = UserInChat(chatId = chatId)
-
-            if (userChats == null) {
-                val newUserChats = UserInChats(userId = participantUserId, chats = listOf(userInChat))
-                if (!userInChatsCollection.insertOne(newUserChats).wasAcknowledged()) return false
-            } else {
-                val updatedChats = userChats.chats + userInChat
-                if (!userInChatsCollection.updateOne(
-                        UserInChats::userId eq participantUserId,
-                        setValue(UserInChats::chats, updatedChats)
-                    ).wasAcknowledged()) return false
+        return try {
+            newSuspendedTransaction(db = database) {
+                for (participantUserId in participantUserIds) {
+                    val existing = UserInChats.select {
+                        UserInChats.userId eq participantUserId and (UserInChats.chatId eq chatId)
+                    }.firstOrNull()
+                    
+                    if (existing == null) {
+                        UserInChats.insert {
+                            it[UserInChats.userId] = participantUserId
+                            it[UserInChats.chatId] = chatId
+                            it[UserInChats.joinedAt] = System.currentTimeMillis()
+                        }
+                    }
+                }
+                true
             }
+        } catch (e: Exception) {
+            false
         }
-        return true
     }
 
     private suspend fun getUserMetadataList(userIds: List<String>): List<UserMetadata> {
@@ -68,7 +72,6 @@ class ChatService(
                         )
                     )
                 } catch (e: Exception) {
-                    // Пропускаем пользователя, если не удалось получить данные
                 }
             }
         }
@@ -77,9 +80,34 @@ class ChatService(
 
     override suspend fun getUserChats(requesterUserId: String): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while receiving user chats: ") {
-            val userChats = userInChatsCollection.findOne(UserInChats::userId eq requesterUserId)
-            val chatIds: List<String> = userChats?.chats?.map { it.chatId } ?: emptyList()
-            val chats = chatCollection.find(Chat::id `in` chatIds).toList()
+            val chats = newSuspendedTransaction(db = database) {
+                val chatRows = (Chats innerJoin UserInChats)
+                    .select {
+                        UserInChats.userId eq requesterUserId
+                    }
+                    .distinctBy { it[Chats.id] }
+                
+                chatRows.map { chatRow ->
+                    val chatId = chatRow[Chats.id].value
+                    val users = ChatUsers.select {
+                        ChatUsers.chatId eq chatId
+                    }.map { userRow ->
+                        UserMetadata(
+                            userId = userRow[ChatUsers.userId],
+                            avatarUrl = userRow[ChatUsers.avatarUrl]
+                        )
+                    }
+                    
+                    Chat(
+                        id = chatId.toString(),
+                        users = users,
+                        chatName = chatRow[Chats.chatName],
+                        description = chatRow[Chats.description],
+                        avatarUrl = chatRow[Chats.avatarUrl]
+                    )
+                }
+            }
+            
             SimpleResponse(
                 status = HttpStatusCode.OK.value,
                 message = "The user's chats were successfully received",
@@ -112,10 +140,41 @@ class ChatService(
             }
 
             if (uniqueParticipantIds.size == 2) {
-                val existingChats = chatCollection.find().toList()
-                val existingPrivateChat = existingChats.find { chat ->
-                    chat.users.size == 2 &&
-                    chat.users.map { it.userId }.toSet() == uniqueParticipantIds.toSet()
+                val existingPrivateChat = newSuspendedTransaction<Chat?>(db = database) {
+                    val allChatIds = ChatUsers
+                        .slice(ChatUsers.chatId)
+                        .select { ChatUsers.chatId.isNotNull() }
+                        .distinct()
+                        .map { it[ChatUsers.chatId] }
+                    
+                    allChatIds.mapNotNull { chatId ->
+                        val users = ChatUsers.select {
+                            ChatUsers.chatId eq chatId
+                        }.map { it[ChatUsers.userId] }.toSet()
+                        
+                        if (users.size == 2 && users == uniqueParticipantIds.toSet()) {
+                            val chatRow = Chats.select {
+                                Chats.id eq chatId
+                            }.first()
+                            
+                            val userMetadata = ChatUsers.select {
+                                ChatUsers.chatId eq chatId
+                            }.map { userRow ->
+                                UserMetadata(
+                                    userId = userRow[ChatUsers.userId],
+                                    avatarUrl = userRow[ChatUsers.avatarUrl]
+                                )
+                            }
+                            
+                            Chat(
+                                id = chatId.toString(),
+                                users = userMetadata,
+                                chatName = chatRow[Chats.chatName],
+                                description = chatRow[Chats.description],
+                                avatarUrl = chatRow[Chats.avatarUrl]
+                            )
+                        } else null
+                    }.firstOrNull()
                 }
                 
                 if (existingPrivateChat != null) {
@@ -135,42 +194,56 @@ class ChatService(
                 )
             }
 
-            val chatId = ObjectId().toString()
-            val chat = Chat(
-                id = chatId,
-                users = userMetadataList,
-                chatName = chatName,
-                description = description,
-                avatarUrl = avatarUrl
-            )
-
-            val isSuccessAddChat = chatCollection.insertOne(chat).wasAcknowledged()
-            if (!isSuccessAddChat) {
+            val chatId = UUID.randomUUID()
+            val result = newSuspendedTransaction(db = database) {
+                try {
+                    Chats.insert {
+                        it[Chats.id] = chatId
+                        it[Chats.chatName] = chatName
+                        it[Chats.description] = description
+                        it[Chats.avatarUrl] = avatarUrl
+                    }
+                    
+                    for (userMetadata in userMetadataList) {
+                        ChatUsers.insert {
+                            it[ChatUsers.chatId] = chatId
+                            it[ChatUsers.userId] = userMetadata.userId
+                            it[ChatUsers.avatarUrl] = userMetadata.avatarUrl
+                        }
+                    }
+                    
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            
+            if (!result) {
                 return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.InternalServerError.value,
                     message = "Couldn't add chat"
                 )
             }
 
-            val chatMessages = ChatMessages(chatId = chatId, messages = listOf())
-            val isSuccessAddMessages = chatMessagesCollection.insertOne(chatMessages).wasAcknowledged()
-            if (!isSuccessAddMessages) {
-                chatCollection.deleteOne(Chat::id eq chatId)
-                return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.InternalServerError.value,
-                    message = "Couldn't add chat messages record"
-                )
-            }
-
             val isSuccessAddUsers = addUsersToChat(chatId, uniqueParticipantIds)
             if (!isSuccessAddUsers) {
-                chatCollection.deleteOne(Chat::id eq chatId)
-                chatMessagesCollection.deleteOne(ChatMessages::chatId eq chatId)
+                newSuspendedTransaction(db = database) {
+                    Chats.deleteWhere { Chats.id eq chatId }
+                    ChatUsers.deleteWhere { ChatUsers.chatId eq chatId }
+                }
                 return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.InternalServerError.value,
                     message = "Couldn't add users to chat"
                 )
             }
+
+            val chat = Chat(
+                id = chatId.toString(),
+                users = userMetadataList,
+                chatName = chatName,
+                description = description,
+                avatarUrl = avatarUrl
+            )
 
             SimpleResponse(
                 status = HttpStatusCode.OK.value,
@@ -188,44 +261,77 @@ class ChatService(
         avatarUrl: String?
     ): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while updating the chat: ") {
-            val userChats = userInChatsCollection.findOne(UserInChats::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.Forbidden.value,
-                    message = "User is not part of any chat"
+            val chatUuid = try {
+                UUID.fromString(chatId)
+            } catch (e: Exception) {
+                return@runWithDefaultOnException SimpleResponse(
+                    status = HttpStatusCode.BadRequest.value,
+                    message = "Invalid chat ID format"
                 )
+            }
             
-            val userChat = userChats.chats.find { it.chatId == chatId }
-                ?: return@runWithDefaultOnException SimpleResponse(
+            val userInChat = newSuspendedTransaction(db = database) {
+                UserInChats.select {
+                    UserInChats.userId eq requesterUserId and (UserInChats.chatId eq chatUuid)
+                }.firstOrNull()
+            }
+            
+            if (userInChat == null) {
+                return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.Forbidden.value,
                     message = "User is not a member of this chat"
                 )
+            }
 
-            val currentChat = chatCollection.findOne(Chat::id eq chatId)
-                ?: return@runWithDefaultOnException SimpleResponse(
+            val currentChatRow = newSuspendedTransaction(db = database) {
+                Chats.select {
+                    Chats.id eq chatUuid
+                }.firstOrNull()
+            }
+            
+            if (currentChatRow == null) {
+                return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.NotFound.value,
                     message = "Chat not found"
                 )
+            }
 
-            val updatedChat = currentChat.copy(
-                chatName = chatName ?: currentChat.chatName,
-                description = description ?: currentChat.description,
-                avatarUrl = avatarUrl ?: currentChat.avatarUrl
-            )
+            newSuspendedTransaction(db = database) {
+                Chats.update({ Chats.id eq chatUuid }) {
+                    if (chatName != null) it[Chats.chatName] = chatName
+                    if (description != null) it[Chats.description] = description
+                    if (avatarUrl != null) it[Chats.avatarUrl] = avatarUrl
+                }
+            }
 
-            val isSuccess = chatCollection.updateOne(Chat::id eq chatId, updatedChat).wasAcknowledged()
-
-            if (isSuccess) {
-                SimpleResponse(
-                    status = HttpStatusCode.OK.value,
-                    message = "The chat has been updated",
-                    data = Json.encodeToJsonElement(updatedChat)
-                )
-            } else {
-                SimpleResponse(
-                    status = HttpStatusCode.BadRequest.value,
-                    message = "Couldn't update chat"
+            val updatedChat = newSuspendedTransaction(db = database) {
+                val chatRow = Chats.select {
+                    Chats.id eq chatUuid
+                }.first()
+                
+                val users = ChatUsers.select {
+                    ChatUsers.chatId eq chatUuid
+                }.map { userRow ->
+                    UserMetadata(
+                        userId = userRow[ChatUsers.userId],
+                        avatarUrl = userRow[ChatUsers.avatarUrl]
+                    )
+                }
+                
+                Chat(
+                    id = chatUuid.toString(),
+                    users = users,
+                    chatName = chatRow[Chats.chatName],
+                    description = chatRow[Chats.description],
+                    avatarUrl = chatRow[Chats.avatarUrl]
                 )
             }
+
+            SimpleResponse(
+                status = HttpStatusCode.OK.value,
+                message = "The chat has been updated",
+                data = Json.encodeToJsonElement(updatedChat)
+            )
         }
     }
 
@@ -235,20 +341,33 @@ class ChatService(
         targetUserId: String
     ): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while adding a user to the chat: ") {
-            val requesterChats = userInChatsCollection.findOne(UserInChats::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.Forbidden.value,
-                    message = "Requester not found"
+            val chatUuid = try {
+                UUID.fromString(chatId)
+            } catch (e: Exception) {
+                return@runWithDefaultOnException SimpleResponse(
+                    status = HttpStatusCode.BadRequest.value,
+                    message = "Invalid chat ID format"
                 )
-
-            val requesterInChat = requesterChats.getUserInChatByChatId(chatId)
-                ?: return@runWithDefaultOnException SimpleResponse(
+            }
+            
+            val requesterInChat = newSuspendedTransaction(db = database) {
+                UserInChats.select {
+                    UserInChats.userId eq requesterUserId and (UserInChats.chatId eq chatUuid)
+                }.firstOrNull()
+            }
+            
+            if (requesterInChat == null) {
+                return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.Forbidden.value,
                     message = "Requester is not a member of this chat"
                 )
+            }
 
-            val targetChats = userInChatsCollection.findOne(UserInChats::userId eq targetUserId)
-            val targetInChat = targetChats?.getUserInChatByChatId(chatId)
+            val targetInChat = newSuspendedTransaction(db = database) {
+                UserInChats.select {
+                    UserInChats.userId eq targetUserId and (UserInChats.chatId eq chatUuid)
+                }.firstOrNull()
+            }
             
             if (targetInChat != null) {
                 return@runWithDefaultOnException SimpleResponse(
@@ -257,11 +376,18 @@ class ChatService(
                 )
             }
 
-            val chat = chatCollection.findOne(Chat::id eq chatId)
-                ?: return@runWithDefaultOnException SimpleResponse(
+            val chatExists = newSuspendedTransaction(db = database) {
+                Chats.select {
+                    Chats.id eq chatUuid
+                }.firstOrNull() != null
+            }
+            
+            if (!chatExists) {
+                return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.NotFound.value,
                     message = "Chat not found"
                 )
+            }
 
             val userDataResponse = userRepository.getUserById(targetUserId)
             val userDataJsonEl = userDataResponse.data
@@ -284,26 +410,28 @@ class ChatService(
                 userId = targetUserId,
                 avatarUrl = userData.avatarUrl
             )
-            val updatedChat = chat.addUserMetadata(newUserMetadata)
 
-            val targetUserInChat = UserInChat(chatId = chatId)
-            val updatedTargetChats = if (targetChats == null) {
-                UserInChats(userId = targetUserId, chats = listOf(targetUserInChat))
-            } else {
-                targetChats.addChat(targetUserInChat)
+            val success = newSuspendedTransaction(db = database) {
+                try {
+                    ChatUsers.insert {
+                        it[ChatUsers.chatId] = chatUuid
+                        it[ChatUsers.userId] = targetUserId
+                        it[ChatUsers.avatarUrl] = userData.avatarUrl
+                    }
+                    
+                    UserInChats.insert {
+                        it[UserInChats.userId] = targetUserId
+                        it[UserInChats.chatId] = chatUuid
+                        it[UserInChats.joinedAt] = System.currentTimeMillis()
+                    }
+                    
+                    true
+                } catch (e: Exception) {
+                    false
+                }
             }
 
-            val isUserInChatUpdateSuccess = userInChatsCollection.updateOne(
-                UserInChats::userId eq targetUserId,
-                updatedTargetChats
-            ).wasAcknowledged()
-            
-            val isChatUpdateSuccess = chatCollection.updateOne(
-                Chat::id eq chatId,
-                updatedChat
-            ).wasAcknowledged()
-
-            if (isUserInChatUpdateSuccess && isChatUpdateSuccess) {
+            if (success) {
                 SimpleResponse(
                     status = HttpStatusCode.OK.value,
                     message = "The user has been successfully added to the chat",
@@ -323,39 +451,58 @@ class ChatService(
         requesterUserId: String
     ): SimpleResponse {
         return runWithDefaultOnException(errorMessage = "An error occurred while leaving the chat: ") {
-            val userChats = userInChatsCollection.findOne(UserInChats::userId eq requesterUserId)
-                ?: return@runWithDefaultOnException SimpleResponse(
-                    status = HttpStatusCode.Forbidden.value,
-                    message = "User not found"
+            val chatUuid = try {
+                UUID.fromString(chatId)
+            } catch (e: Exception) {
+                return@runWithDefaultOnException SimpleResponse(
+                    status = HttpStatusCode.BadRequest.value,
+                    message = "Invalid chat ID format"
                 )
-
-            val userInChat = userChats.getUserInChatByChatId(chatId)
-                ?: return@runWithDefaultOnException SimpleResponse(
+            }
+            
+            val userInChat = newSuspendedTransaction(db = database) {
+                UserInChats.select {
+                    UserInChats.userId eq requesterUserId and (UserInChats.chatId eq chatUuid)
+                }.firstOrNull()
+            }
+            
+            if (userInChat == null) {
+                return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.Forbidden.value,
                     message = "User is not a member of this chat"
                 )
+            }
 
-            val chat = chatCollection.findOne(Chat::id eq chatId)
-                ?: return@runWithDefaultOnException SimpleResponse(
+            val chatExists = newSuspendedTransaction(db = database) {
+                Chats.select {
+                    Chats.id eq chatUuid
+                }.firstOrNull() != null
+            }
+            
+            if (!chatExists) {
+                return@runWithDefaultOnException SimpleResponse(
                     status = HttpStatusCode.NotFound.value,
                     message = "Chat not found"
                 )
+            }
 
-            val updatedUserChats = userChats.removeChatById(chatId)
-            val isUserInChatUpdateSuccess = userInChatsCollection.updateOne(
-                UserInChats::userId eq requesterUserId,
-                updatedUserChats
-            ).wasAcknowledged()
+            val success = newSuspendedTransaction(db = database) {
+                try {
+                    UserInChats.deleteWhere {
+                        UserInChats.userId eq requesterUserId and (UserInChats.chatId eq chatUuid)
+                    }
+                    
+                    ChatUsers.deleteWhere {
+                        ChatUsers.chatId eq chatUuid and (ChatUsers.userId eq requesterUserId)
+                    }
+                    
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
 
-            val updatedChat = chat.copy(
-                users = chat.users.filter { it.userId != requesterUserId }
-            )
-            val isChatUpdateSuccess = chatCollection.updateOne(
-                Chat::id eq chatId,
-                updatedChat
-            ).wasAcknowledged()
-
-            if (isUserInChatUpdateSuccess && isChatUpdateSuccess) {
+            if (success) {
                 SimpleResponse(
                     status = HttpStatusCode.OK.value,
                     message = "User has successfully left the chat"

@@ -32,7 +32,7 @@ fun Route.chatRoute() {
     val chatRepository: ChatRepository = get<ChatRepository>()
     val tokenRepository: TokenRepository = get<TokenRepository>()
     val messageRepository: MessageRepository = get<MessageRepository>()
-    val dataBase = get<org.litote.kmongo.coroutine.CoroutineDatabase>()
+    val database = get<org.jetbrains.exposed.sql.Database>()
 
     webSocket("/ws/chats") {
         val accessToken = call.attributes.getOrNull(JwtTokenKey) ?: return@webSocket close(
@@ -158,7 +158,7 @@ fun Route.chatRoute() {
                                 )
                             }
                             is SocketMessage.SubscribeToMessages -> {
-                                if (isUserMemberOfChat(dataBase, requesterUserId, socketMessage.chatId)) {
+                                if (isUserMemberOfChat(database, requesterUserId, socketMessage.chatId)) {
                                     RoomManager.subscribeToMessages(socketMessage.chatId, clientSession)
                                     SimpleResponse(
                                         status = HttpStatusCode.OK.value,

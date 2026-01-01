@@ -7,7 +7,7 @@ import org.koin.dsl.module
 val friendModule = module {
     single<FriendRepository> {
         FriendService(
-            dataBase = get(),
+            database = get(),
             userRepository = get(),
         )
     }

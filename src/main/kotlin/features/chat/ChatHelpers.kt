@@ -1,13 +1,16 @@
 package com.piedpiper.features.chat
 
-import com.piedpiper.features.chat.data.models.UserInChats
+import com.piedpiper.features.database.UserInChats
 import com.piedpiper.features.token.data.repository.TokenRepository
-import io.ktor.http.HttpStatusCode
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.decodeFromJsonElement
-import org.litote.kmongo.coroutine.CoroutineDatabase
-import org.litote.kmongo.eq
+import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.select
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import java.util.UUID
 
 suspend fun extractRequesterUserId(
     tokenRepository: TokenRepository,
@@ -29,17 +32,21 @@ suspend fun extractRequesterUserId(
     }
 }
 
-/**
- * Проверяет, является ли пользователь участником чата
- * @return true если пользователь является участником, false иначе
- */
 suspend fun isUserMemberOfChat(
-    dataBase: CoroutineDatabase,
+    database: Database,
     userId: String,
     chatId: String
 ): Boolean {
-    val userInChatsCollection = dataBase.getCollection<UserInChats>()
-    val userChats = userInChatsCollection.findOne(UserInChats::userId eq userId) ?: return false
-    return userChats.getUserInChatByChatId(chatId) != null
+    val chatUuid = try {
+        UUID.fromString(chatId)
+    } catch (e: Exception) {
+        return false
+    }
+    
+    return newSuspendedTransaction(db = database) {
+        UserInChats.select {
+            UserInChats.userId eq userId and (UserInChats.chatId eq chatUuid)
+        }.firstOrNull() != null
+    }
 }
 

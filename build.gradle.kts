@@ -36,9 +36,12 @@ dependencies {
     implementation(libs.ktor.server.config.yaml)
     testImplementation(libs.ktor.server.test.host)
     testImplementation(libs.kotlin.test.junit)
-    implementation(libs.kmongo.core)
-    implementation(libs.kmongo.async)
-    implementation(libs.kmongo.coroutine)
+    implementation(libs.exposed.core)
+    implementation(libs.exposed.dao)
+    implementation(libs.exposed.jdbc)
+    implementation(libs.exposed.kotlin.datetime)
+    implementation(libs.postgresql)
+    implementation(libs.hikaricp)
     testImplementation(libs.ktor.server.test.host)
     testImplementation(libs.koin.test.junit5)
     testImplementation(libs.kotlin.test.junit)
@@ -52,25 +55,31 @@ compileKotlin.compilerOptions {
     freeCompilerArgs.set(listOf("-Xannotation-default-target=param-property"))
 }
 
-ktor {
-    docker {
-        jreVersion.set(JavaVersion.VERSION_21)
-        localImageName.set("piedpiper-chat-container")
-        imageTag.set("1.0")
-        portMappings.set(listOf(
-            io.ktor.plugin.features.DockerPortMapping(
-                80,
-                8083,
-                io.ktor.plugin.features.DockerPortMappingProtocol.TCP
-            )
-        ))
+jib {
+    from {
+        image = "eclipse-temurin:21-jre"
+        platforms {
+            platform {
+                architecture = "arm64"
+                os = "linux"
+            }
+            platform {
+                architecture = "amd64"
+                os = "linux"
+            }
+        }
+    }
+    to {
+        image = "nikita0504/piedpiper-chat-container"
+        tags = setOf("1.1", "latest")
 
-        externalRegistry.set(
-            io.ktor.plugin.features.DockerImageRegistry.dockerHub(
-                appName = provider { "piedpiper-chat-container" },
-                username = providers.environmentVariable("DOCKER_HUB_USERNAME"),
-                password = providers.environmentVariable("DOCKER_HUB_PASSWORD")
-            )
-        )
+        auth {
+            username = System.getenv("DOCKER_HUB_USERNAME") ?: ""
+            password = System.getenv("DOCKER_HUB_PASSWORD") ?: ""
+        }
+    }
+    container {
+        mainClass = "com.piedpiper.ApplicationKt"
+        ports = listOf("8081")
     }
 }

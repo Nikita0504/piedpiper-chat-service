@@ -1,20 +1,38 @@
 package com.piedpiper.features.database.di
 
 import com.piedpiper.common.Parameters
-import com.mongodb.reactivestreams.client.MongoClient
+import com.piedpiper.features.database.Chats
+import com.piedpiper.features.database.ChatUsers
+import com.piedpiper.features.database.FriendLists
+import com.piedpiper.features.database.Messages
+import com.piedpiper.features.database.UserInChats
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
+import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.SchemaUtils
+import org.jetbrains.exposed.sql.transactions.transaction
 import org.koin.dsl.module
-import org.litote.kmongo.coroutine.CoroutineDatabase
-import org.litote.kmongo.coroutine.coroutine
-import org.litote.kmongo.reactivestreams.KMongo
 
 val dataBaseModule = module {
-    single<MongoClient> {
-        KMongo.createClient(
-            connectionString = "mongodb://localhost:27017"
+    single<Database> {
+        val parameters = Parameters()
+        val database = Database.connect(
+            url = parameters.POSTGRES_URL,
+            driver = "org.postgresql.Driver",
+            user = parameters.POSTGRES_USER,
+            password = parameters.POSTGRES_PASSWORD,
         )
-    }
 
-    single<CoroutineDatabase> {
-        get<MongoClient>().getDatabase(Parameters().DATABASE).coroutine
+        transaction(database) {
+            SchemaUtils.createMissingTablesAndColumns(
+                Chats,
+                ChatUsers,
+                UserInChats,
+                Messages,
+                FriendLists
+            )
+        }
+
+        database
     }
 }

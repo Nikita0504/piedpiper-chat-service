@@ -9,14 +9,14 @@ import org.koin.dsl.module
 val chatModule = module {
     single<ChatRepository> {
         ChatService(
-            dataBase = get(),
+            database = get(),
             userRepository = get(),
         )
     }
 
     single<MessageRepository> {
         MessageService(
-            dataBase = get(),
+            database = get(),
         )
     }
 }
